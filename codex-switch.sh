@@ -556,6 +556,55 @@ install_node_runtime() {
     die "无法自动安装 npm。请先手动安装 Node.js 和 npm。"
 }
 
+write_gemini_wrapper() {
+    local target="/usr/local/bin/gemini"
+    local bin_path="$1"
+    local wrapper_source
+
+    wrapper_source="$(mktemp)"
+    cat > "$wrapper_source" <<EOF
+#!/usr/bin/env bash
+exec node "$bin_path" "\$@"
+EOF
+
+    run_privileged install -m 755 "$wrapper_source" "$target"
+    rm -f "$wrapper_source"
+}
+
+ensure_gemini_command() {
+    local prefix
+    local package_dir=""
+    local package_json=""
+    local bin_rel=""
+    local bin_path=""
+
+    has_cmd gemini && return 0
+
+    prefix="$(npm prefix -g 2>/dev/null || npm config get prefix 2>/dev/null || true)"
+    for package_dir in \
+        "$prefix/lib/node_modules/@google/gemini-cli" \
+        "$prefix/lib/node_modules/@google-dev/gemini-cli" \
+        "/usr/lib/node_modules/@google/gemini-cli" \
+        "/usr/local/lib/node_modules/@google/gemini-cli"
+    do
+        package_json="$package_dir/package.json"
+        if [[ -f "$package_json" ]]; then
+            bin_rel="$(jq -r '.bin.gemini // empty' "$package_json" 2>/dev/null || true)"
+            if [[ -z "$bin_rel" ]]; then
+                bin_rel="$(jq -r 'if (.bin|type)=="string" then .bin else empty end' "$package_json" 2>/dev/null || true)"
+            fi
+            if [[ -n "$bin_rel" && -f "$package_dir/$bin_rel" ]]; then
+                bin_path="$package_dir/$bin_rel"
+                write_gemini_wrapper "$bin_path"
+                hash -r
+                has_cmd gemini && return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 install_codex_cli() {
     local current_profile=""
 
@@ -603,6 +652,7 @@ install_gemini_cli() {
     fi
 
     hash -r
+    ensure_gemini_command || true
     require_cmd gemini "Gemini CLI 安装后仍不可用，请检查 npm 全局 bin 目录是否在 PATH 中。"
     success "Gemini CLI 已安装"
 
