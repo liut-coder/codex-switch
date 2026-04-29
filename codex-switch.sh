@@ -19,6 +19,8 @@ ENV_FILE="$CONFIG_ROOT/current.env"
 
 CODEX_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/codex"
 CODEX_CONFIG_FILE="$CODEX_CONFIG_DIR/config.json"
+CODEX_TOML_DIR="$HOME/.codex"
+CODEX_TOML_FILE="$CODEX_TOML_DIR/config.toml"
 
 print_color() {
     local color="$1"
@@ -139,7 +141,74 @@ sync_shell_environment() {
 
     write_env_file "$base_url" "$api_key" "$model"
     update_shell_rc "$HOME/.bashrc"
-    [[ -f "$HOME/.zshrc" ]] && update_shell_rc "$HOME/.zshrc"
+    if [[ -f "$HOME/.zshrc" ]]; then
+        update_shell_rc "$HOME/.zshrc"
+    fi
+}
+
+upsert_toml_root_key() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    if grep -Eq "^${key}[[:space:]]*=" "$file"; then
+        sed -i "s|^${key}[[:space:]]*=.*$|${key} = \"${value}\"|" "$file"
+    else
+        printf "%s = \"%s\"\n%s" "$key" "$value" "$(cat "$file")" > "${file}.tmp"
+        mv "${file}.tmp" "$file"
+    fi
+}
+
+write_codex_toml() {
+    local base_url="$1"
+    local api_key="$2"
+    local model="$3"
+    local tmp_file
+
+    mkdir -p "$CODEX_TOML_DIR"
+    [[ -f "$CODEX_TOML_FILE" ]] || touch "$CODEX_TOML_FILE"
+
+    upsert_toml_root_key "$CODEX_TOML_FILE" "model_provider" "OpenAI"
+    upsert_toml_root_key "$CODEX_TOML_FILE" "model" "$model"
+
+    tmp_file="$(mktemp)"
+    awk '
+        BEGIN { in_section=0; skip_name=0; skip_base=0; skip_key=0 }
+        /^\[model_providers\.OpenAI\]$/ {
+            print
+            print "name = \"OpenAI\""
+            print "base_url = \"__BASE_URL__\""
+            print "api_key = \"__API_KEY__\""
+            in_section=1
+            skip_name=1
+            skip_base=1
+            skip_key=1
+            next
+        }
+        /^\[/ {
+            in_section=0
+        }
+        in_section && skip_name && /^name[[:space:]]*=/ { next }
+        in_section && skip_base && /^base_url[[:space:]]*=/ { next }
+        in_section && skip_key && /^api_key[[:space:]]*=/ { next }
+        { print }
+    ' "$CODEX_TOML_FILE" > "$tmp_file"
+
+    if ! grep -Fq '[model_providers.OpenAI]' "$tmp_file"; then
+        {
+            printf "\n[model_providers.OpenAI]\n"
+            printf "name = \"OpenAI\"\n"
+            printf "base_url = \"%s\"\n" "$base_url"
+            printf "api_key = \"%s\"\n" "$api_key"
+        } >> "$tmp_file"
+    else
+        sed -i \
+            -e "s|__BASE_URL__|$base_url|g" \
+            -e "s|__API_KEY__|$api_key|g" \
+            "$tmp_file"
+    fi
+
+    mv "$tmp_file" "$CODEX_TOML_FILE"
 }
 
 sync_codex_cli() {
@@ -149,11 +218,17 @@ sync_codex_cli() {
 
     mkdir -p "$CODEX_CONFIG_DIR"
 
-    if has_cmd codex; then
+    if has_cmd codex && codex help config >/dev/null 2>&1; then
         codex config set base_url "$base_url" >/dev/null
         codex config set api_key "$api_key" >/dev/null
         codex config set model "$model" >/dev/null
         success "已同步到官方 Codex CLI"
+        return
+    fi
+
+    if has_cmd codex; then
+        write_codex_toml "$base_url" "$api_key" "$model"
+        success "已同步到 ~/.codex/config.toml"
         return
     fi
 
@@ -322,6 +397,80 @@ launch_codex() {
     exec codex
 }
 
+run_privileged() {
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+install_node_runtime() {
+    if has_cmd npm; then
+        return 0
+    fi
+
+    info "未检测到 npm，开始安装 Node.js 运行环境"
+
+    if has_cmd apt-get; then
+        run_privileged apt-get update
+        run_privileged apt-get install -y nodejs npm
+        return 0
+    fi
+
+    if has_cmd dnf; then
+        run_privileged dnf install -y nodejs npm
+        return 0
+    fi
+
+    if has_cmd yum; then
+        run_privileged yum install -y nodejs npm
+        return 0
+    fi
+
+    if has_cmd pacman; then
+        run_privileged pacman -Sy --noconfirm nodejs npm
+        return 0
+    fi
+
+    if has_cmd brew; then
+        brew install node
+        return 0
+    fi
+
+    die "无法自动安装 npm。请先手动安装 Node.js 和 npm。"
+}
+
+install_codex_cli() {
+    local current_profile=""
+
+    install_node_runtime
+    require_cmd npm "npm 安装失败，请先检查 Node.js 环境。"
+
+    info "安装或升级官方 Codex CLI"
+    if npm install -g @openai/codex; then
+        :
+    else
+        warn "当前用户全局安装失败，尝试使用 sudo"
+        run_privileged npm install -g @openai/codex
+    fi
+
+    hash -r
+    require_cmd codex "Codex CLI 安装后仍不可用，请检查 npm 全局 bin 目录是否在 PATH 中。"
+    success "Codex CLI 已安装: $(codex --version 2>/dev/null || echo 'codex')"
+
+    current_profile="$(get_current_profile_name)"
+    if [[ -n "$current_profile" ]] && profile_exists "$current_profile"; then
+        sync_codex_cli \
+            "$(jq -r --arg name "$current_profile" '.[$name].base_url' "$PROFILES_FILE")" \
+            "$(jq -r --arg name "$current_profile" '.[$name].api_key' "$PROFILES_FILE")" \
+            "$(jq -r --arg name "$current_profile" '.[$name].model' "$PROFILES_FILE")"
+        success "已同步当前配置 '$current_profile' 到 Codex CLI"
+    else
+        warn "当前没有激活配置。你可以先运行 'sw' 配置中转站，或直接执行 'codex --login' 登录。"
+    fi
+}
+
 prompt_required() {
     local label="$1"
     local value=""
@@ -432,6 +581,7 @@ show_help() {
 Usage: $APP_NAME [option]
 
 Options:
+  --install-codex        一键安装或升级官方 Codex CLI
   --list                 列出所有配置
   --switch NAME          切换到指定配置并启动 Codex
   --activate NAME        只切换配置，不启动 Codex
@@ -473,6 +623,7 @@ main_menu() {
         printf "3) 直接启动（使用当前配置）\n"
         printf "4) 管理配置\n"
         printf "5) 测试当前配置\n"
+        printf "6) 一键部署官方 Codex CLI\n"
         printf "0) 退出\n"
         read -r -p "选择: " choice
 
@@ -485,6 +636,10 @@ main_menu() {
                 current="$(get_current_profile_name)"
                 [[ -n "$current" ]] || die "当前没有已激活的配置"
                 test_profile "$current"
+                read -r -p "按回车继续..." _
+                ;;
+            6)
+                install_codex_cli
                 read -r -p "按回车继续..." _
                 ;;
             0) exit 0 ;;
@@ -500,6 +655,10 @@ main() {
             ;;
         --version|-v)
             show_version
+            ;;
+        --install-codex)
+            init_store
+            install_codex_cli
             ;;
         --list)
             init_store

@@ -18,6 +18,7 @@
 - 一键切换当前配置
 - 自动写入 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`
 - 自动同步 `codex config set ...`
+- 支持一键安装或升级官方 `codex` CLI
 - 支持连接测试
 - 支持交互式菜单和命令行模式
 
@@ -65,8 +66,25 @@ codex-switch --test work
 codex-switch --show
 codex-switch --add work https://api.example.com/v1 sk-xxx gpt-5.4
 codex-switch --delete work
+codex-switch --install-codex
 codex-switch --launch
 ```
+
+## 一键部署 Codex CLI
+
+```bash
+codex-switch --install-codex
+```
+
+或在交互菜单中选择“`一键部署官方 Codex CLI`”。
+
+脚本会优先检测 `npm`，如果缺失则尝试自动安装 `nodejs` / `npm`，然后执行：
+
+```bash
+npm install -g @openai/codex
+```
+
+如果当前已有激活配置，安装完成后会自动同步到 Codex CLI。
 
 ## 存储位置
 
